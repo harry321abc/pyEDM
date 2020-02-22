@@ -6,7 +6,10 @@ from matplotlib.pyplot import show, axhline
 
 import pyBindEDM
 import pyEDM.AuxFunc
- 
+
+import pyEDM.devEDM
+import pyEDM.devEDM_ArgParse
+
 #------------------------------------------------------------------------
 # 
 #------------------------------------------------------------------------
@@ -149,6 +152,9 @@ def SMap( pathIn       = "./",
           columns      = "",
           target       = "",
           smapFile     = "",
+          solver       = "svd", # tikhonov, elasticNet
+          alpha        = None,
+          L1_ratios    = None,
           jacobians    = "",
           embedded     = False,
           verbose      = False,
@@ -158,7 +164,7 @@ def SMap( pathIn       = "./",
 
     # Establish DF as empty list or Pandas DataFrame for SMap()
     if dataFile :
-        DF = pyBindEDM.DF() 
+        DF = pyBindEDM.DF()
     elif isinstance( dataFrame, DataFrame ) :
         if dataFrame.empty :
             raise Exception( "SMap(): dataFrame is empty." )
@@ -166,33 +172,111 @@ def SMap( pathIn       = "./",
     else :
         raise Exception( "SMap(): Invalid data input." )
     
-    # D is a Python dict from pybind11 < cppEDM SMap:
-    #  { "predictions" : {}, "coefficients" : {} }
-    D = pyBindEDM.SMap( pathIn,
-                        dataFile,
-                        DF,
-                        pathOut,
-                        predictFile,
-                        lib,
-                        pred,
-                        E, 
-                        Tp,
-                        knn,
-                        tau,
-                        theta,
-                        exclusionRadius,
-                        columns,
-                        target,
-                        smapFile,
-                        jacobians,
-                        embedded,
-                        const_pred,
-                        verbose  )
+    if "tikhonov" in solver.lower() or "elasticnet" in solver.lower() :
+        # devEDM activation
+        regularised = True
+        
+        args = pyEDM.devEDM_ArgParse.ParseCmdLine() # Default values for devEDM
 
-    df_pred = DataFrame( D['predictions']  ) # Convert to pandas DataFrame
-    df_coef = DataFrame( D['coefficients'] ) # Convert to pandas DataFrame
+        # Populate args with pyEDM parameters
+        args.method          = 'smap'
+        args.prediction      = [ int(x) for x in pred.split() ]
+        args.library         = [ int(x) for x in lib.split()  ]
+        args.E               = E
+        args.k_NN            = knn
+        args.Tp              = Tp
+        args.theta           = theta
+        args.exclusionRadius = exclusionRadius
+        args.solver          = solver     # svd, tikhonov, elasticnet
+        args.SVDSignificance = 0.00001
+        args.TikhonovAlpha   = alpha
+        args.ElasticNetAlpha = L1_ratios
+        args.tau             = abs( tau ) # devEDM has forwardTau
+        args.forwardTau      = tau > 0    # true : false
+        args.columns         = columns.split()
+        args.target          = target
+        args.embedded        = embedded
+        args.path            = pathIn
+        args.inputFile       = dataFile
+        args.outputFile      = predictFile
+        args.outputSmapFile  = smapFile
+        args.plot            = showPlot
+        args.verbose         = verbose
+        args.warnings        = False
 
-    if showPlot :
+        pyEDM.devEDM_ArgParse.AdjustArgs( args )
+
+    else:
+        regularised = False
+
+        
+    if "svd" in solver.lower() :
+        #--------------------------------------------------
+        # cppEDM Smap() LAPACK dgelss
+        #--------------------------------------------------
+        #   D is a Python dict from pybind11 < cppEDM SMap:
+        #     { "predictions" : {}, "coefficients" : {} }
+        D = pyBindEDM.SMap( pathIn,
+                            dataFile,
+                            DF,
+                            pathOut,
+                            predictFile,
+                            lib,
+                            pred,
+                            E, 
+                            Tp,
+                            knn,
+                            tau,
+                            theta,
+                            exclusionRadius,
+                            columns,
+                            target,
+                            smapFile,
+                            jacobians,
+                            embedded,
+                            const_pred,
+                            verbose )
+
+        df_pred = DataFrame( D['predictions']  ) # Convert to pandas DataFrame
+        df_coef = DataFrame( D['coefficients'] ) # Convert to pandas DataFrame
+
+    elif regularised :
+        #--------------------------------------------------
+        # Pure Python devEDM data I/O & SMap
+        #--------------------------------------------------
+        if args.embedded :
+            if dataFrame is None :
+                # dataFile is an embedding or multivariable data frame.
+                # ReadEmbeddedData() sets args.E to the number of columns
+                # if the -c (columns) and -t (target) options are used.
+                embedding, colNames, target = \
+                    pyEDM.devEDM.ReadEmbeddedData( args )
+            else:
+                # Data matrix is passed in as parameter, already embedded
+                embedding = dataFrame.values
+                target    = dataFrame[ target ]
+                colNames  = args.columns
+                # target taken as-is from input parameters
+        else :
+            # dataFile are timeseries data to be embedded by EmbedData
+            embedding, colNames, target = \
+                pyEDM.devEDM.EmbedData( args, dataFrame.values, args.columns )
+
+        # Call devEDM.Prediction() with args.method = 'smap'
+        # SMap() solution method is determined by args.solver
+        rho, rmse, mae, header, output, smap_output, coef_header = \
+            pyEDM.devEDM.Prediction( embedding, colNames, target, args )
+
+        # Create pandas DataFrame's
+        df_pred = DataFrame( output,      columns = header.split(",") )
+        df_coef = DataFrame( smap_output, columns = coef_header.split(",") )
+        
+    else:
+        raise Exception( "SMap(): Invalid solver." )
+
+
+    if showPlot and not regularised :
+        # pyEDM plotting (not devEDM)
         pyEDM.AuxFunc.PlotObsPred( df_pred, dataFile, E, Tp, False )
         pyEDM.AuxFunc.PlotCoeff  ( df_coef, dataFile, E, Tp )
 
